@@ -34,15 +34,14 @@ impl OplusVibrator {
         self.gen.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Maps ColorOS strength (700..=2400 mV) perceptually to 0.15..=1.0 (0 -> 0.0).
+    /// Maps ColorOS strength (0..=2400 mV) linearly to 0.0..=1.0, matching stock OPlus HAL.
     fn vmax_to_amplitude(strength: i32) -> f32 {
         if strength <= 0 {
             0.0
         } else if strength <= 255 {
             (strength as f32 / 255.0).clamp(0.0, 1.0)
         } else {
-            let t = ((strength as f32 - 700.0) / (2400.0 - 700.0)).clamp(0.0, 1.0);
-            0.15 + 0.85 * t.powf(1.5)
+            (strength as f32 / 2400.0).clamp(0.0, 1.0)
         }
     }
 
@@ -103,9 +102,29 @@ impl IOplusVibrator for OplusVibrator {
     fn r#linearMotorVibratorOn(&self, duration: i32, strength: i32, _extra: bool) -> BinderResult<()> {
         let amp = Self::vmax_to_amplitude(strength);
         let gen = self.next_gen();
+        if duration > 0 && duration <= 120 {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.amplitude = amp;
+                let style = inner.touch_style;
+                let f0 = inner.f0_hz;
+                let pcm = inner
+                    .effects
+                    .get_pcm(4, style)
+                    .unwrap_or_else(|| Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0)));
+                let dur = EffectLibrary::duration_ms(&pcm);
+                inner.short_rtp_until =
+                    Some(std::time::Instant::now() + Duration::from_millis((dur as u64) + 50));
+                if let Some(m) = inner.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp.max(0.38), &self.gen, gen);
+                }
+            }
+            alogi!("linearMotorVibratorOn({}ms, strength={}) -> crisp duk amp={:.3}", duration, strength, amp);
+            return Ok(());
+        }
         let len = (duration.max(10) as u32).min(u16::MAX as u32) as u16;
         alogi!("linearMotorVibratorOn dur={} strength={} amp={:.3}", len, strength, amp);
         if let Ok(mut inner) = self.inner.lock() {
+            inner.short_rtp_until = None;
             inner.amplitude = amp;
             inner.play_constant(len, amp);
         }
@@ -238,8 +257,45 @@ impl IOplusVibrator for OplusVibrator {
 
     fn r#on(&self, timeout_or_amp: i32, cb: Option<&Strong<dyn IRichtapCallback>>) -> BinderResult<()> {
         let gen = self.next_gen();
+        if timeout_or_amp > 0 && timeout_or_amp <= 120 {
+            let dur = if let Ok(mut inner) = self.inner.lock() {
+                let style = inner.touch_style;
+                let amp = inner.amplitude.clamp(0.38, 1.0);
+                let f0 = inner.f0_hz;
+                let pcm = inner
+                    .effects
+                    .get_pcm(4, style)
+                    .unwrap_or_else(|| Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0)));
+                let dur = EffectLibrary::duration_ms(&pcm);
+                inner.short_rtp_until =
+                    Some(std::time::Instant::now() + Duration::from_millis((dur as u64) + 50));
+                if let Some(m) = inner.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                }
+                dur
+            } else {
+                21
+            };
+            if let Some(c) = cb.cloned() {
+                let gen_arc = Arc::clone(&self.gen);
+                thread::spawn(move || {
+                    let mut left = (dur as u64) + 20;
+                    while left > 0 {
+                        if gen_arc.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        let step = left.min(15);
+                        thread::sleep(Duration::from_millis(step));
+                        left -= step;
+                    }
+                    let _ = c.onCallback(0);
+                });
+            }
+            return Ok(());
+        }
         let len = (timeout_or_amp.clamp(10, 5000)) as u16;
         if let Ok(mut inner) = self.inner.lock() {
+            inner.short_rtp_until = None;
             let amp = inner.amplitude;
             inner.play_constant(len, amp);
         }

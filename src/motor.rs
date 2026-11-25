@@ -108,10 +108,10 @@ impl Motor {
         }
     }
 
-    /// Maps normalized amplitude 0.0..=1.0 smoothly to aw86927 active FF_GAIN range 0x4EFF..=0x7FFF (level 0x1E..=0x80).
+    /// Maps normalized amplitude 0.0..=1.0 using exact stock OPlus FF_GAIN formula (0x1333..=0x7FFF).
     pub fn set_hw_gain(&mut self, amp: f32) -> io::Result<()> {
         let a = amp.clamp(0.0, 1.0);
-        let gain = (0x4effu32 + (a * (0x7fffu32 - 0x4effu32) as f32) as u32).min(0x7fff) as i32;
+        let gain = (0x1333u32 + (a * 0x6cccu32 as f32) as u32).min(0x7fff) as i32;
         self.write_ev_ff(FF_GAIN, gain)
     }
 

@@ -26,20 +26,39 @@ impl EffectLibrary {
             xiaomi_fallback: HashMap::new(),
         };
 
-        // Primary: ROM /odm/etc/vibrator; secondary: /data/local/tmp/vibrator for live testing
+        // Primary: Official OPlus 0809 LRA waveforms (extracted from liboplusvibratoreffect.so),
+        // then fill remaining extended IDs (111, 302..370) from 9999 vibrator_effect.json.
+        // Exception: keep crisp 9999 effect_2 (8.7ms @ 230Hz) for back gesture so it feels distinct
+        // and snappier than 0809 effect_4 (16.5ms @ 182Hz "duk" for fingerprint).
         for base in ["/odm/etc/vibrator", "/data/local/tmp/vibrator"] {
+            let json_0809 = Path::new(base).join("vibrator_effect_0809.json");
+            if let Ok(text) = fs::read_to_string(&json_0809) {
+                lib.parse_oplus_json(&text, base, true);
+            }
             let json_path = Path::new(base).join("vibrator_effect.json");
             if let Ok(text) = fs::read_to_string(&json_path) {
-                lib.parse_oplus_json(&text, base);
-                if !lib.def_effects.is_empty() {
-                    crate::alogi!(
-                        "loaded OPlus vibrator_effect.json from {}: def={} soft={}",
-                        base,
-                        lib.def_effects.len(),
-                        lib.soft_effects.len()
-                    );
-                    break;
-                }
+                lib.parse_oplus_json(&text, base, false);
+            }
+            // Prefer snappy 9999/def/effect_2.bin (8.7ms @ 231Hz) for back gesture click
+            let crisp_back = Path::new(base).join("9999/def/effect_2.bin");
+            if crisp_back.exists() {
+                lib.def_effects.insert(
+                    2,
+                    EffectEntry {
+                        path: crisp_back,
+                        rate_hz: SAMPLE_RATE,
+                        cached: None,
+                    },
+                );
+            }
+            if !lib.def_effects.is_empty() {
+                crate::alogi!(
+                    "loaded OPlus waveforms from {} (0809 primary + 9999 extended): def={} soft={}",
+                    base,
+                    lib.def_effects.len(),
+                    lib.soft_effects.len()
+                );
+                break;
             }
         }
 
@@ -52,7 +71,7 @@ impl EffectLibrary {
         lib
     }
 
-    fn parse_oplus_json(&mut self, text: &str, base_dir: &str) {
+    fn parse_oplus_json(&mut self, text: &str, base_dir: &str, overwrite: bool) {
         let mut in_soft = false;
         let mut cur_file: Option<String> = None;
         let mut cur_id: Option<i32> = None;
@@ -91,10 +110,13 @@ impl EffectLibrary {
                             rate_hz: cur_rate,
                             cached: None,
                         };
-                        if in_soft {
-                            self.soft_effects.insert(id, entry);
+                        let map = if in_soft {
+                            &mut self.soft_effects
                         } else {
-                            self.def_effects.insert(id, entry);
+                            &mut self.def_effects
+                        };
+                        if overwrite || !map.contains_key(&id) {
+                            map.insert(id, entry);
                         }
                     }
                 }
@@ -134,19 +156,35 @@ impl EffectLibrary {
 
     /// Returns cached 24 kHz signed 8-bit PCM for `effect_id` and `touch_style` (0=crisp/def, 1=gentle/soft).
     pub fn get_pcm(&mut self, effect_id: i32, touch_style: i32) -> Option<Arc<Vec<i8>>> {
+        // Effect 111 (Gboard key tap): use official OPlus 0809 crisp click (effect_1: 10.42ms @ 192Hz)
+        // with a +25% RMS punch boost (soft-clamped to ±127) so typing feels crisp and clearly felt.
+        if effect_id == 111 {
+            let base = self.get_pcm(1, touch_style)?;
+            let boosted: Vec<i8> = base
+                .iter()
+                .map(|&s| ((s as f32) * 1.25).round().clamp(-128.0, 127.0) as i8)
+                .collect();
+            return Some(Arc::new(boosted));
+        }
+        // Effect 315 (SystemUI lock/FP): map to official OPlus 0809 resonant "duk" (effect_4: 16.46ms @ 182.3Hz).
+        let resolved_id = match effect_id {
+            315 => 4,
+            id => id,
+        };
+
         if touch_style == 1 {
-            if let Some(entry) = self.soft_effects.get_mut(&effect_id) {
+            if let Some(entry) = self.soft_effects.get_mut(&resolved_id) {
                 if let Some(pcm) = load_or_cache(entry) {
                     return Some(pcm);
                 }
             }
         }
-        if let Some(entry) = self.def_effects.get_mut(&effect_id) {
+        if let Some(entry) = self.def_effects.get_mut(&resolved_id) {
             if let Some(pcm) = load_or_cache(entry) {
                 return Some(pcm);
             }
         }
-        if let Some(entry) = self.xiaomi_fallback.get_mut(&effect_id) {
+        if let Some(entry) = self.xiaomi_fallback.get_mut(&resolved_id) {
             if let Some(pcm) = load_or_cache(entry) {
                 return Some(pcm);
             }
@@ -188,7 +226,7 @@ fn load_or_cache(entry: &mut EffectEntry) -> Option<Arc<Vec<i8>>> {
     if raw.is_empty() {
         return None;
     }
-    let mut pcm: Vec<i8> = if entry.rate_hz == 8000 {
+    let pcm: Vec<i8> = if entry.rate_hz == 8000 {
         // Upsample 8 kHz -> 24 kHz (3x linear interpolation)
         let mut out = Vec::with_capacity(raw.len() * 3);
         for i in 0..raw.len() {
@@ -212,15 +250,8 @@ fn load_or_cache(entry: &mut EffectEntry) -> Option<Arc<Vec<i8>>> {
         raw.into_iter().map(|b| b as i8).collect()
     };
 
-    // Normalize quiet OPlus 0916 waveforms (e.g. peak 28..80/127) to punch cleanly on peridot's 0809 LRA.
-    let peak = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
-    if peak > 4 && peak < 115 {
-        let boost = (118.0f32 / peak as f32).min(4.0);
-        for s in &mut pcm {
-            *s = ((*s as f32) * boost).round().clamp(-128.0, 127.0) as i8;
-        }
-    }
-
+    // Preserve original OPlus relative waveform loudness (e.g. effect_105 volume/brightness tick at peak=32
+    // must stay light and subtle, not boosted 4x into a heavy intensity thump).
     let arc = Arc::new(pcm);
     entry.cached = Some(Arc::clone(&arc));
     Some(arc)

@@ -36,11 +36,13 @@ const DEFAULT_RING_AMP: f32 = 0.85;
 pub struct Inner {
     pub(crate) motor: Option<Motor>,
     pub(crate) effects: EffectLibrary,
-    /// Normalized user/slider intensity 0.0..=1.0
+    /// Standard Android amplitude (0.0..=1.0) used for IVibrator::on() / FF_CONSTANT
     pub(crate) amplitude: f32,
+    /// ColorOS per-effect amplitude set by IVibrator::setAmplitude(1.0..=2.0) -> linear (amp - 1.0)
+    pub(crate) effect_amplitude: Option<f32>,
     /// Dynamic scale for RichTap HE (0.0..=1.0)
     pub(crate) dynamic_scale: f32,
-    /// 0 = Crisp (def_style), 1 = Gentle (soft_style)
+    /// 0 = Crisp (def_style / 10000.0), 1 = Gentle (soft_style / 10001.0)
     pub(crate) touch_style: i32,
     pub(crate) f0_hz: f32,
     pub(crate) ext_gen: u64,
@@ -101,6 +103,7 @@ impl VibratorService {
                 motor,
                 effects,
                 amplitude: 1.0,
+                effect_amplitude: None,
                 dynamic_scale: 1.0,
                 touch_style: 0,
                 f0_hz,
@@ -296,34 +299,45 @@ impl IVibrator for VibratorService {
         callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<()> {
         let gen = self.next_gen();
-        // Short pulses (<= 65ms, e.g. fingerprint unlock / touch feedback) should be a crisp
-        // LRA "duk" thud/click via custom_wave rather than a buzzy FF_CONSTANT jzzzz!
-        if timeout_ms > 0 && timeout_ms <= 65 {
-            let (pcm_opt, amp, f0_hz) = {
+        // Short pulses (<= 120ms, e.g. fingerprint unlock / touch feedback) should be a crisp
+        // resonant LRA "duk" thud via custom_wave rather than a buzzy FF_CONSTANT jzzzz!
+        if timeout_ms > 0 && timeout_ms <= 120 {
+            let (dur_ms, amp) = {
                 let Ok(mut inner) = self.inner.lock() else {
                     return Ok(());
                 };
                 let style = inner.touch_style;
-                let amp = inner.amplitude.clamp(0.0, 1.0);
+                let amp = (inner.amplitude * 0.68).clamp(0.32, 0.72);
                 let f0 = inner.f0_hz;
-                // Pick crisp click (effect_4, 21ms) for <=35ms or solid "duk" (effect_3/5) for 36..65ms
-                let eid = if timeout_ms <= 35 { 4 } else { 3 };
-                let pcm = inner.effects.get_pcm(eid, style);
-                inner.short_rtp_until = Some(Instant::now() + Duration::from_millis(65));
-                (pcm, amp, f0)
+                // effect_4 (21ms @ 166.3Hz, peak=127) is a solid, crisp resonant "duk" on peridot's 169.3Hz LRA
+                let pcm = inner
+                    .effects
+                    .get_pcm(4, style)
+                    .unwrap_or_else(|| Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0)));
+                let dur = EffectLibrary::duration_ms(&pcm);
+                inner.short_rtp_until =
+                    Some(Instant::now() + Duration::from_millis((dur as u64) + 50));
+                if let Some(m) = inner.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                }
+                (dur, amp)
             };
-            let pcm = pcm_opt.unwrap_or_else(|| {
-                Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0_hz))
-            });
-            alogd!("IVibrator::on({}ms) -> crisp duk PCM amp={:.2}", timeout_ms, amp);
-            Self::spawn_pcm_play(
-                Arc::clone(&self.inner),
-                Arc::clone(&self.gen),
-                gen,
-                pcm,
-                amp,
-                callback.cloned(),
-            );
+            alogd!("IVibrator::on({}ms) -> sync crisp duk PCM amp={:.2} dur={}ms", timeout_ms, amp, dur_ms);
+            if let Some(cb_cloned) = callback.cloned() {
+                let gen_arc = Arc::clone(&self.gen);
+                thread::spawn(move || {
+                    let mut left = (dur_ms as u64) + 20;
+                    while left > 0 {
+                        if gen_arc.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        let step = left.min(15);
+                        thread::sleep(Duration::from_millis(step));
+                        left -= step;
+                    }
+                    let _ = cb_cloned.onComplete();
+                });
+            }
             return Ok(());
         }
 
@@ -351,57 +365,102 @@ impl IVibrator for VibratorService {
         strength: EffectStrength,
         callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<i32> {
+        // Exact stock OPlus strength mapping (0x3FFF / 0x5FFF / 0x7FFF) used only when ColorOS
+        // did not supply a per-effect magnitude via setAmplitude(1.0..=2.0).
         let strength_scale = match strength {
-            EffectStrength::LIGHT => 0.55,
-            EffectStrength::MEDIUM => 0.80,
+            EffectStrength::LIGHT => 0.50,
+            EffectStrength::MEDIUM => 0.75,
             EffectStrength::STRONG => 1.0,
-            _ => 0.80,
+            _ => 0.75,
         };
         let oplus_id = map_android_effect_to_oplus_id(effect);
         let gen = self.next_gen();
 
-        let (pcm_opt, amp, f0_hz) = {
+        let (pcm, amp, dur_ms, played_sync) = {
             let Ok(mut inner) = self.inner.lock() else {
                 return Ok(20);
             };
             let style = inner.touch_style;
-            let amp = (inner.amplitude * strength_scale).clamp(0.0, 1.0);
+            let raw_amp = match inner.effect_amplitude {
+                Some(ea) => ea.clamp(0.0, 1.0),
+                None => (inner.amplitude * strength_scale).clamp(0.0, 1.0),
+            };
+            // Per-effect acoustic tuning for peridot's 0809 LRA (f0=169.3Hz):
+            // - 105 (volume/brightness slider tick): keep subtle & consistent across slider range
+            //   instead of ramping loudly like a haptic intensity slider.
+            // - 4 / 315 (fingerprint unlock / lock "duk"): tame full-resonance slam to refined 0.68.
+            // - 2 (back gesture crisp click): clean 0.78 snap, distinct from fingerprint "duk".
+            // - 111 (Gboard key tap): lift crisp 10.4ms click so typing feels punchy & tucky.
+            // - 107 (scroll top/bottom edge bounce): lift low-RMS (23/127) wave at strength 800..1200.
+            let amp = if raw_amp <= 0.001 {
+                0.0
+            } else {
+                match oplus_id {
+                    105 => 0.24 + 0.10 * raw_amp,
+                    4 | 315 => (raw_amp * 0.68).clamp(0.32, 0.72),
+                    2 => (raw_amp * 0.78).clamp(0.35, 0.82),
+                    111 => (raw_amp * 1.45).clamp(0.60, 1.0),
+                    107 => (raw_amp * 1.85).clamp(0.55, 1.0),
+                    _ => raw_amp,
+                }
+            };
             let f0 = inner.f0_hz;
-            let pcm = inner.effects.get_pcm(oplus_id, style);
-            (pcm, amp, f0)
+            let pcm = inner.effects.get_pcm(oplus_id, style).unwrap_or_else(|| {
+                Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0))
+            });
+            let dur_ms = EffectLibrary::duration_ms(&pcm);
+            if dur_ms <= 250 {
+                // Play short/medium one-shot effects synchronously into the aw86927 FIFO (<1ms)
+                // so there is zero thread-spawn race with IVibrator::off() on rapid gestures or FP unlock.
+                inner.short_rtp_until =
+                    Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 45));
+                if let Some(m) = inner.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                }
+                (pcm, amp, dur_ms, true)
+            } else {
+                inner.short_rtp_until = None;
+                (pcm, amp, dur_ms, false)
+            }
         };
 
-        let pcm = pcm_opt.unwrap_or_else(|| {
-            // Synthesize fallback click if .bin file not present
-            let fallback = synth::synthesize_he(&[], 1, 0, 1.0, 0, f0_hz);
-            Arc::new(fallback)
-        });
-        let dur_ms = EffectLibrary::duration_ms(&pcm);
-        if dur_ms <= 80 {
-            if let Ok(mut inner) = self.inner.lock() {
-                inner.short_rtp_until =
-                    Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 35));
-            }
-        }
         alogd!(
-            "IVibrator::perform({:?}, {:?}) -> oplus_id={} amp={:.2} dur={}ms",
+            "IVibrator::perform({:?}, {:?}) -> oplus_id={} amp={:.2} dur={}ms sync={}",
             effect,
             strength,
             oplus_id,
             amp,
-            dur_ms
+            dur_ms,
+            played_sync
         );
-        Self::spawn_pcm_play(
-            Arc::clone(&self.inner),
-            Arc::clone(&self.gen),
-            gen,
-            pcm,
-            amp,
-            callback.cloned(),
-        );
-        // Add +40ms hardware startup margin (matching Xiaomi stock HAL) so VibrationThread
-        // does not cancel aw86927 RTP FIFO before playback finishes.
-        Ok(dur_ms + 40)
+        if played_sync {
+            if let Some(cb_cloned) = callback.cloned() {
+                let gen_arc = Arc::clone(&self.gen);
+                thread::spawn(move || {
+                    let mut left = (dur_ms as u64) + 20;
+                    while left > 0 {
+                        if gen_arc.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        let step = left.min(15);
+                        thread::sleep(Duration::from_millis(step));
+                        left -= step;
+                    }
+                    let _ = cb_cloned.onComplete();
+                });
+            }
+        } else {
+            Self::spawn_pcm_play(
+                Arc::clone(&self.inner),
+                Arc::clone(&self.gen),
+                gen,
+                pcm,
+                amp,
+                callback.cloned(),
+            );
+        }
+        // Add +45ms hardware startup margin so VibrationThread does not cancel aw86927 FIFO prematurely.
+        Ok(dur_ms + 45)
     }
 
     fn r#getSupportedEffects(&self) -> BinderResult<Vec<Effect>> {
@@ -414,20 +473,40 @@ impl IVibrator for VibratorService {
     }
 
     fn r#setAmplitude(&self, amplitude: f32) -> BinderResult<()> {
-        // ColorOS encodes haptic slider strength (700..2400 mV) as 1.0 + strength/2400.0 (1.292..2.000).
-        // Standard Android apps pass 0.0..=1.0 directly.
-        let amp = if amplitude > 1.0 {
-            let strength = (amplitude - 1.0) * 2400.0;
-            let t = ((strength - 700.0) / (2400.0 - 700.0)).clamp(0.0, 1.0);
-            0.15 + 0.85 * t.powf(1.5)
-        } else {
-            amplitude.clamp(0.0, 1.0)
-        };
+        // Exact reverse-engineered stock OPlus IVibrator::setAmplitude protocol (0xe904..0xe9ec):
+        // - 10000.0 => Crisp touch style (0)
+        // - 10001.0 => Soft/Gentle touch style (1)
+        // - (1.0, 2.0] => per-effect linear magnitude (amplitude - 1.0) for next perform(), no live FF_GAIN write
+        // - (0.0, 1.0] => standard Android amplitude + live FF_GAIN update
+        if (amplitude - 10001.0).abs() < 0.5 {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.touch_style = 1;
+            }
+            alogd!("IVibrator::setAmplitude(10001) -> touch_style=1 (soft)");
+            return Ok(());
+        }
+        if (amplitude - 10000.0).abs() < 0.5 {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.touch_style = 0;
+            }
+            alogd!("IVibrator::setAmplitude(10000) -> touch_style=0 (crisp)");
+            return Ok(());
+        }
+        if amplitude > 1.0 && amplitude <= 2.0 {
+            let eff_amp = (amplitude - 1.0).clamp(0.0, 1.0);
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.effect_amplitude = Some(eff_amp);
+            }
+            alogd!("IVibrator::setAmplitude({:.3}) -> effect_amp={:.3}", amplitude, eff_amp);
+            return Ok(());
+        }
+        let amp = amplitude.clamp(0.0, 1.0);
         if let Ok(mut inner) = self.inner.lock() {
             inner.amplitude = amp;
+            inner.effect_amplitude = None;
             inner.update_live_gain();
         }
-        alogd!("IVibrator::setAmplitude({:.3}) -> {:.3}", amplitude, amp);
+        alogd!("IVibrator::setAmplitude({:.3}) -> const_amp={:.3}", amplitude, amp);
         Ok(())
     }
 
