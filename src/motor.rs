@@ -4,6 +4,7 @@ use std::io;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const EVIOCGNAME_64: c_ulong = 0x8040_4506;
 const EVIOCGBIT_FF: c_ulong = 0x8010_4535;
@@ -37,6 +38,8 @@ pub struct Motor {
     period_size: usize,
     active_ff_id: i16,
     active_is_rtp: bool,
+    rtp_done_at: Option<Instant>,
+    hw_gain_is_max: bool,
     f0_hz: f32,
     f0_raw: i32,
     lra_resistance: i32,
@@ -67,6 +70,8 @@ impl Motor {
             period_size: period_size.max(512),
             active_ff_id: -1,
             active_is_rtp: false,
+            rtp_done_at: None,
+            hw_gain_is_max: false,
             f0_hz,
             f0_raw,
             lra_resistance,
@@ -112,7 +117,14 @@ impl Motor {
     pub fn set_hw_gain(&mut self, amp: f32) -> io::Result<()> {
         let a = amp.clamp(0.0, 1.0);
         let gain = (0x1333u32 + (a * 0x6cccu32 as f32) as u32).min(0x7fff) as i32;
-        self.write_ev_ff(FF_GAIN, gain)
+        if gain == 0x7fff && self.hw_gain_is_max {
+            return Ok(());
+        }
+        let res = self.write_ev_ff(FF_GAIN, gain);
+        if res.is_ok() {
+            self.hw_gain_is_max = gain == 0x7fff;
+        }
+        res
     }
 
     fn write_ev_ff(&self, code: u16, value: i32) -> io::Result<()> {
@@ -126,7 +138,16 @@ impl Motor {
 
     fn erase_ff(&mut self) {
         if self.active_ff_id >= 0 {
-            let _ = self.write_ev_ff(self.active_ff_id as u16, 0);
+            // Skip redundant EV_FF stop event if a previous short RTP already finished draining naturally;
+            // avoids queueing a spurious aw86927_rtp_work_routine(state=0) + 15ms standby stall on fast typing.
+            let already_drained = self.active_is_rtp
+                && self
+                    .rtp_done_at
+                    .map(|t| Instant::now() >= t)
+                    .unwrap_or(false);
+            if !already_drained {
+                let _ = self.write_ev_ff(self.active_ff_id as u16, 0);
+            }
             loop {
                 let rc = unsafe { ioctl(self.evdev_fd, EVIOCRMFF, self.active_ff_id as c_long) };
                 if rc != -1 {
@@ -139,6 +160,7 @@ impl Motor {
             }
             self.active_ff_id = -1;
             self.active_is_rtp = false;
+            self.rtp_done_at = None;
         }
     }
 
@@ -165,6 +187,34 @@ impl Motor {
         effect[16..18].copy_from_slice(&level.to_le_bytes());
 
         self.upload_and_start(&mut effect, false)
+    }
+
+    /// Plays a preloaded aw86927 hardware SRAM waveform (`ram_effect_id` 0..5, e.g. 0=click, 2=tick, 4=pop)
+    /// via AW86927_ACTIVATE_RAM_MODE (~2ms latency, zero RTP startup stall, zero drops on rapid typing).
+    pub fn play_ram(&mut self, ram_effect_id: i16, amp: f32) -> io::Result<()> {
+        self.erase_ff();
+        let a = amp.clamp(0.0, 1.0);
+        if a <= 0.001 {
+            return Ok(());
+        }
+        let mut custom_data = [0i16; 3];
+        custom_data[0] = ram_effect_id;
+
+        let mut effect = [0u8; 48];
+        effect[0..2].copy_from_slice(&FF_PERIODIC.to_le_bytes());
+        effect[2..4].copy_from_slice(&(-1i16).to_le_bytes());
+        effect[16..18].copy_from_slice(&FF_CUSTOM.to_le_bytes());
+        // aw86927_haptic_effect_strength maps gain/magnitude 0x0000..0x7FFF -> level 0x1E..0x80
+        let mag = (0x3fffu32 + (a * 0x4000u32 as f32) as u32).min(0x7fff) as u16;
+        effect[20..22].copy_from_slice(&mag.to_le_bytes());
+        effect[36..40].copy_from_slice(&3u32.to_le_bytes());
+        effect[40..48].copy_from_slice(&(custom_data.as_ptr() as u64).to_le_bytes());
+
+        let _ = self.set_hw_gain(a);
+        self.upload_and_start(&mut effect, false)?;
+        self.rtp_done_at = Some(Instant::now() + Duration::from_millis(25));
+        self.active_is_rtp = true;
+        Ok(())
     }
 
     /// Streams 24 kHz signed 8-bit PCM via aw86927 custom_wave RTP FIFO.
@@ -235,6 +285,9 @@ impl Motor {
         if pcm.len() % period == 0 {
             let _ = write_all_retry(self.wave_fd, &[0u8]);
         }
+
+        let dur_ms = ((pcm.len() as u64 * 1000) / SAMPLE_RATE as u64).max(5);
+        self.rtp_done_at = Some(Instant::now() + Duration::from_millis(dur_ms + 25));
 
         Ok(())
     }

@@ -386,41 +386,51 @@ impl IVibrator for VibratorService {
                 None => (inner.amplitude * strength_scale).clamp(0.0, 1.0),
             };
             // Per-effect acoustic tuning for peridot's 0809 LRA (f0=169.3Hz):
-            // - 105 (volume/brightness slider tick): keep subtle & consistent across slider range
-            //   instead of ramping loudly like a haptic intensity slider.
-            // - 4 / 315 (fingerprint unlock / lock "duk"): tame full-resonance slam to refined 0.68.
-            // - 2 (back gesture crisp click): clean 0.78 snap, distinct from fingerprint "duk".
-            // - 111 (Gboard key tap): lift crisp 10.4ms click so typing feels punchy & tucky.
-            // - 107 (scroll top/bottom edge bounce): lift low-RMS (23/127) wave at strength 800..1200.
+            // - 111 (Gboard key tap): play via aw86927 hardware SRAM click (effect_id=0, ~2ms latency,
+            //   zero 35ms RTP startup stall, zero dropped keystrokes on rapid two-thumb typing).
+            // - 105 (volume/brightness slider tick): consistent crisp tick across slider range.
+            // - 4 / 315 (fingerprint unlock / lock "duk"): refined resonant 0.68 thud.
+            // - 2 (back gesture crisp click): snappy 0.78 click, distinct from fingerprint "duk".
+            // - 107 (slider top/bottom boundary stop): boosted 0.85..1.0 bump.
             let amp = if raw_amp <= 0.001 {
                 0.0
             } else {
                 match oplus_id {
                     105 => 0.72 + 0.16 * raw_amp,
                     4 | 315 => (raw_amp * 0.68).clamp(0.32, 0.72),
-                    2 => (raw_amp * 0.78).clamp(0.35, 0.82),
-                    111 => (raw_amp * 1.45).clamp(0.60, 1.0),
+                    2 => (raw_amp * 1.35).clamp(0.65, 1.0),
+                    111 => (raw_amp * 1.15).clamp(0.50, 1.0),
                     107 => (raw_amp * 2.2).clamp(0.85, 1.0),
                     _ => raw_amp,
                 }
             };
-            let f0 = inner.f0_hz;
-            let pcm = inner.effects.get_pcm(oplus_id, style).unwrap_or_else(|| {
-                Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0))
-            });
-            let dur_ms = EffectLibrary::duration_ms(&pcm);
-            if dur_ms <= 250 {
-                // Play short/medium one-shot effects synchronously into the aw86927 FIFO (<1ms)
-                // so there is zero thread-spawn race with IVibrator::off() on rapid gestures or FP unlock.
-                inner.short_rtp_until =
-                    Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 45));
+            if oplus_id == 111 {
+                // Hardware RAM mode: 0 = crisp click (def), 2 = lighter tick (soft)
+                let ram_id = if style == 1 { 2 } else { 0 };
+                inner.short_rtp_until = Some(Instant::now() + Duration::from_millis(35));
                 if let Some(m) = inner.motor.as_mut() {
-                    let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                    let _ = m.play_ram(ram_id, amp);
                 }
-                (pcm, amp, dur_ms, true)
+                (Arc::new(Vec::new()), amp, 12, true)
             } else {
-                inner.short_rtp_until = None;
-                (pcm, amp, dur_ms, false)
+                let f0 = inner.f0_hz;
+                let pcm = inner.effects.get_pcm(oplus_id, style).unwrap_or_else(|| {
+                    Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0))
+                });
+                let dur_ms = EffectLibrary::duration_ms(&pcm);
+                if dur_ms <= 250 {
+                    // aw86927 RTP startup takes ~35ms; protect FIFO with dur_ms + 75ms so
+                    // IVibrator::off() never aborts a short RTP effect before RTP_GO! fires.
+                    inner.short_rtp_until =
+                        Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 75));
+                    if let Some(m) = inner.motor.as_mut() {
+                        let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                    }
+                    (pcm, amp, dur_ms, true)
+                } else {
+                    inner.short_rtp_until = None;
+                    (pcm, amp, dur_ms, false)
+                }
             }
         };
 
@@ -436,13 +446,14 @@ impl IVibrator for VibratorService {
         if played_sync {
             if let Some(cb_cloned) = callback.cloned() {
                 let gen_arc = Arc::clone(&self.gen);
+                let cb_margin = if oplus_id == 111 { 12 } else { 20 };
                 thread::spawn(move || {
-                    let mut left = (dur_ms as u64) + 20;
+                    let mut left = (dur_ms as u64) + cb_margin;
                     while left > 0 {
                         if gen_arc.load(Ordering::SeqCst) != gen {
                             return;
                         }
-                        let step = left.min(15);
+                        let step = left.min(10);
                         thread::sleep(Duration::from_millis(step));
                         left -= step;
                     }
@@ -459,8 +470,9 @@ impl IVibrator for VibratorService {
                 callback.cloned(),
             );
         }
-        // Add +45ms hardware startup margin so VibrationThread does not cancel aw86927 FIFO prematurely.
-        Ok(dur_ms + 45)
+        // Tighter margin (+18ms) for Gboard rapid typing (111), +45ms for other effects.
+        let ret_margin = if oplus_id == 111 { 18 } else { 45 };
+        Ok(dur_ms + ret_margin)
     }
 
     fn r#getSupportedEffects(&self) -> BinderResult<Vec<Effect>> {
