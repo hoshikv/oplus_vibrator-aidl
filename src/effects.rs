@@ -166,11 +166,35 @@ impl EffectLibrary {
                 .collect();
             return Some(Arc::new(boosted));
         }
+        // Effect 7 (scroll top/bottom edge bounce): 0809 effect_7 has very tiny peak (16/127, rms=8.8).
+        // Boost PCM 4.5x (peak 16 -> 72, rms 8.8 -> ~40) so scroll-edge bounce feels crisp and clear.
+        if effect_id == 7 {
+            let base = self.get_pcm_raw(7, touch_style)?;
+            let boosted: Vec<i8> = base
+                .iter()
+                .map(|&s| ((s as f32) * 4.5).round().clamp(-128.0, 127.0) as i8)
+                .collect();
+            return Some(Arc::new(boosted));
+        }
+        // Effect 107 (slider top & bottom boundary stop): 0809 effect_107 has low peak (86/127)
+        // and low RMS (23/127); boost PCM 2.0x so hitting top/bottom end feels clear and balanced.
+        if effect_id == 107 {
+            let base = self.get_pcm_raw(107, touch_style)?;
+            let boosted: Vec<i8> = base
+                .iter()
+                .map(|&s| ((s as f32) * 2.0).round().clamp(-128.0, 127.0) as i8)
+                .collect();
+            return Some(Arc::new(boosted));
+        }
         // Effect 315 (SystemUI lock/FP): map to official OPlus 0809 resonant "duk" (effect_4: 16.46ms @ 182.3Hz).
         let resolved_id = match effect_id {
             315 => 4,
             id => id,
         };
+        self.get_pcm_raw(resolved_id, touch_style)
+    }
+
+    fn get_pcm_raw(&mut self, resolved_id: i32, touch_style: i32) -> Option<Arc<Vec<i8>>> {
 
         if touch_style == 1 {
             if let Some(entry) = self.soft_effects.get_mut(&resolved_id) {

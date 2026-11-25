@@ -396,11 +396,11 @@ impl IVibrator for VibratorService {
                 0.0
             } else {
                 match oplus_id {
-                    105 => 0.24 + 0.10 * raw_amp,
+                    105 => 0.72 + 0.16 * raw_amp,
                     4 | 315 => (raw_amp * 0.68).clamp(0.32, 0.72),
                     2 => (raw_amp * 0.78).clamp(0.35, 0.82),
                     111 => (raw_amp * 1.45).clamp(0.60, 1.0),
-                    107 => (raw_amp * 1.85).clamp(0.55, 1.0),
+                    107 => (raw_amp * 2.2).clamp(0.85, 1.0),
                     _ => raw_amp,
                 }
             };
