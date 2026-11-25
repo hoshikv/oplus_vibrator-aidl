@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rsbinder::{BinderResult, Strong};
 
@@ -46,6 +46,8 @@ pub struct Inner {
     pub(crate) ext_gen: u64,
     pub(crate) ext_active: bool,
     pub(crate) ext_saved_amp: Option<f32>,
+    /// Tracks when a short one-shot RTP effect started so premature IVibrator::off() doesn't kill it mid-FIFO.
+    pub(crate) short_rtp_until: Option<Instant>,
 }
 
 impl Inner {
@@ -105,6 +107,7 @@ impl VibratorService {
                 ext_gen: 0,
                 ext_active: false,
                 ext_saved_amp: None,
+                short_rtp_until: None,
             })),
             gen: Arc::new(AtomicU64::new(0)),
         }
@@ -272,6 +275,16 @@ impl IVibrator for VibratorService {
     }
 
     fn r#off(&self) -> BinderResult<()> {
+        if let Ok(mut inner) = self.inner.lock() {
+            if let Some(until) = inner.short_rtp_until {
+                if Instant::now() < until {
+                    // Let short one-shot RTP effect finish draining aw86927 FIFO naturally
+                    alogd!("IVibrator::off() deferred (short RTP still draining)");
+                    return Ok(());
+                }
+            }
+            inner.short_rtp_until = None;
+        }
         alogd!("IVibrator::off()");
         self.stop_and_advance();
         Ok(())
@@ -283,12 +296,44 @@ impl IVibrator for VibratorService {
         callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<()> {
         let gen = self.next_gen();
+        // Short pulses (<= 65ms, e.g. fingerprint unlock / touch feedback) should be a crisp
+        // LRA "duk" thud/click via custom_wave rather than a buzzy FF_CONSTANT jzzzz!
+        if timeout_ms > 0 && timeout_ms <= 65 {
+            let (pcm_opt, amp, f0_hz) = {
+                let Ok(mut inner) = self.inner.lock() else {
+                    return Ok(());
+                };
+                let style = inner.touch_style;
+                let amp = inner.amplitude.clamp(0.0, 1.0);
+                let f0 = inner.f0_hz;
+                // Pick crisp click (effect_4, 21ms) for <=35ms or solid "duk" (effect_3/5) for 36..65ms
+                let eid = if timeout_ms <= 35 { 4 } else { 3 };
+                let pcm = inner.effects.get_pcm(eid, style);
+                inner.short_rtp_until = Some(Instant::now() + Duration::from_millis(65));
+                (pcm, amp, f0)
+            };
+            let pcm = pcm_opt.unwrap_or_else(|| {
+                Arc::new(synth::synthesize_he(&[], 1, 0, 1.0, 0, f0_hz))
+            });
+            alogd!("IVibrator::on({}ms) -> crisp duk PCM amp={:.2}", timeout_ms, amp);
+            Self::spawn_pcm_play(
+                Arc::clone(&self.inner),
+                Arc::clone(&self.gen),
+                gen,
+                pcm,
+                amp,
+                callback.cloned(),
+            );
+            return Ok(());
+        }
+
         let len = if timeout_ms > 0 {
             (timeout_ms as u32).min(MAX_DURATION_MS as u32) as u16
         } else {
             MAX_DURATION_MS
         };
         if let Ok(mut inner) = self.inner.lock() {
+            inner.short_rtp_until = None;
             let amp = inner.amplitude;
             inner.play_constant(len, amp);
         }
@@ -332,6 +377,12 @@ impl IVibrator for VibratorService {
             Arc::new(fallback)
         });
         let dur_ms = EffectLibrary::duration_ms(&pcm);
+        if dur_ms <= 80 {
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.short_rtp_until =
+                    Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 35));
+            }
+        }
         alogd!(
             "IVibrator::perform({:?}, {:?}) -> oplus_id={} amp={:.2} dur={}ms",
             effect,
@@ -348,7 +399,9 @@ impl IVibrator for VibratorService {
             amp,
             callback.cloned(),
         );
-        Ok(dur_ms)
+        // Add +40ms hardware startup margin (matching Xiaomi stock HAL) so VibrationThread
+        // does not cancel aw86927 RTP FIFO before playback finishes.
+        Ok(dur_ms + 40)
     }
 
     fn r#getSupportedEffects(&self) -> BinderResult<Vec<Effect>> {

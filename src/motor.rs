@@ -188,9 +188,9 @@ impl Motor {
             return self.play_constant(dur, a);
         }
 
-        // Set hardware gain proportional to amplitude (0.25..1.0) alongside PCM scaling
-        // so both hardware DAC gain and PCM dynamic range track the intensity slider cleanly.
-        let _ = self.set_hw_gain((0.25 + 0.75 * a).clamp(0.0, 1.0));
+        // Keep hardware DAC at full headroom (0x7FFF -> level 0x80) and apply slider scaling
+        // cleanly once on PCM samples so max intensity hits full punch without double-attenuation.
+        let _ = self.set_hw_gain(1.0);
 
         let mut custom_data = [0i16; 3];
         custom_data[0] = self.custom_wave_id;

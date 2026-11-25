@@ -188,7 +188,7 @@ fn load_or_cache(entry: &mut EffectEntry) -> Option<Arc<Vec<i8>>> {
     if raw.is_empty() {
         return None;
     }
-    let pcm: Vec<i8> = if entry.rate_hz == 8000 {
+    let mut pcm: Vec<i8> = if entry.rate_hz == 8000 {
         // Upsample 8 kHz -> 24 kHz (3x linear interpolation)
         let mut out = Vec::with_capacity(raw.len() * 3);
         for i in 0..raw.len() {
@@ -211,6 +211,16 @@ fn load_or_cache(entry: &mut EffectEntry) -> Option<Arc<Vec<i8>>> {
     } else {
         raw.into_iter().map(|b| b as i8).collect()
     };
+
+    // Normalize quiet OPlus 0916 waveforms (e.g. peak 28..80/127) to punch cleanly on peridot's 0809 LRA.
+    let peak = pcm.iter().map(|&s| (s as i32).abs()).max().unwrap_or(0);
+    if peak > 4 && peak < 115 {
+        let boost = (118.0f32 / peak as f32).min(4.0);
+        for s in &mut pcm {
+            *s = ((*s as f32) * boost).round().clamp(-128.0, 127.0) as i8;
+        }
+    }
+
     let arc = Arc::new(pcm);
     entry.cached = Some(Arc::clone(&arc));
     Some(arc)
