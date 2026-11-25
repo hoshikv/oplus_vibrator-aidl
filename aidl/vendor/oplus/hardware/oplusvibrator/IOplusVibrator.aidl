@@ -12,8 +12,10 @@ interface IOplusVibrator {
     void off(@nullable IRichtapCallback callback);
     void on(int amplitude, @nullable IRichtapCallback callback);
     int perform(int effectId, byte strength, @nullable IRichtapCallback callback);
-    void performHe(int a, int b, int c, int d, int[] e, @nullable IRichtapCallback callback);
-    void setHapticParam(int[] params, int length, @nullable IRichtapCallback callback);
+    void performEnvelope(in int[] envInfo, boolean fastFlag, @nullable IRichtapCallback callback);
+    void performRtp(in ParcelFileDescriptor fd, @nullable IRichtapCallback callback);
+    void performHe(int a, int b, int c, int d, in int[] e, @nullable IRichtapCallback callback);
+    void setHapticParam(in int[] params, int length, @nullable IRichtapCallback callback);
     void linearMotorVibratorOff();
     void linearMotorVibratorOn(int duration, int strength, boolean extra);
     void startCalibrate();
@@ -25,7 +27,7 @@ interface IOplusVibrator {
     void writeGunType(int type);
     void writeGunMode(int mode);
     void writeBulletNum(int num);
-    void writeHapticAudio(int[] data);
+    void writeHapticAudio(String data);
     void setVibratorTouchStyle(int style);
     int getVibratorTouchStyle();
     void setPowerOnVibratorSwitch(String switchStr);

@@ -361,9 +361,12 @@ impl IVibrator for VibratorService {
     }
 
     fn r#setAmplitude(&self, amplitude: f32) -> BinderResult<()> {
-        // Android standard is (0.0, 1.0]; ColorOS sometimes passes up to 2.0
+        // ColorOS encodes haptic slider strength (700..2400 mV) as 1.0 + strength/2400.0 (1.292..2.000).
+        // Standard Android apps pass 0.0..=1.0 directly.
         let amp = if amplitude > 1.0 {
-            (amplitude / 2.0).clamp(0.0, 1.0)
+            let strength = (amplitude - 1.0) * 2400.0;
+            let t = ((strength - 700.0) / (2400.0 - 700.0)).clamp(0.0, 1.0);
+            0.15 + 0.85 * t.powf(1.5)
         } else {
             amplitude.clamp(0.0, 1.0)
         };

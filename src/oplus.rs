@@ -1,9 +1,17 @@
+use std::io::Read;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rsbinder::{BinderResult, Strong};
+use rsbinder::{BinderResult, ParcelFileDescriptor, Strong};
+
+extern "C" {
+    #[link_name = "dup"]
+    fn libc_dup(fd: std::ffi::c_int) -> std::ffi::c_int;
+}
 
 use crate::effects::EffectLibrary;
 use crate::gen_oplus::vendor::aac::hardware::richtap::vibrator::IRichtapCallback::IRichtapCallback;
@@ -26,12 +34,15 @@ impl OplusVibrator {
         self.gen.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Maps ColorOS strength (0..=2400 mV, or 0..=255 if <=255 and called from richtap) to 0.0..=1.0.
+    /// Maps ColorOS strength (700..=2400 mV) perceptually to 0.15..=1.0 (0 -> 0.0).
     fn vmax_to_amplitude(strength: i32) -> f32 {
         if strength <= 0 {
             0.0
+        } else if strength <= 255 {
+            (strength as f32 / 255.0).clamp(0.0, 1.0)
         } else {
-            (strength as f32 / 2400.0).clamp(0.0, 1.0)
+            let t = ((strength as f32 - 700.0) / (2400.0 - 700.0)).clamp(0.0, 1.0);
+            0.15 + 0.85 * t.powf(1.5)
         }
     }
 
@@ -293,6 +304,81 @@ impl IOplusVibrator for OplusVibrator {
         Ok(dur_ms)
     }
 
+    fn r#performEnvelope(
+        &self,
+        env_info: &[i32],
+        fast_flag: bool,
+        cb: Option<&Strong<dyn IRichtapCallback>>,
+    ) -> BinderResult<()> {
+        let gen = self.next_gen();
+        let (user_amp, dyn_scale, f0_hz) = {
+            let Ok(inner) = self.inner.lock() else {
+                return Ok(());
+            };
+            (inner.amplitude, inner.dynamic_scale, inner.f0_hz)
+        };
+        let total_amp = (user_amp * dyn_scale).clamp(0.0, 1.0);
+        alogd!(
+            "oplus performEnvelope(len={}, fast={}) amp={:.3}",
+            env_info.len(),
+            fast_flag,
+            total_amp
+        );
+        let pcm = Arc::new(synth::synthesize_he(env_info, 1, 0, 1.0, 0, f0_hz));
+        Self::spawn_pcm_with_richtap_cb(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.gen),
+            gen,
+            pcm,
+            total_amp,
+            cb.cloned(),
+        );
+        Ok(())
+    }
+
+    fn r#performRtp(
+        &self,
+        fd: &ParcelFileDescriptor,
+        cb: Option<&Strong<dyn IRichtapCallback>>,
+    ) -> BinderResult<()> {
+        let gen = self.next_gen();
+        let raw_fd = fd.as_raw_fd();
+        let mut bytes = Vec::new();
+        if raw_fd >= 0 {
+            let dup_fd = unsafe { libc_dup(raw_fd) };
+            if dup_fd >= 0 {
+                let mut f = unsafe { std::fs::File::from_raw_fd(dup_fd) };
+                let _ = f.read_to_end(&mut bytes);
+            }
+        }
+        let (user_amp, dyn_scale) = {
+            let Ok(inner) = self.inner.lock() else {
+                return Ok(());
+            };
+            (inner.amplitude, inner.dynamic_scale)
+        };
+        let total_amp = (user_amp * dyn_scale).clamp(0.0, 1.0);
+        alogd!(
+            "oplus performRtp(bytes={}, amp={:.3})",
+            bytes.len(),
+            total_amp
+        );
+        if !bytes.is_empty() {
+            let pcm: Vec<i8> = bytes.into_iter().map(|b| b as i8).collect();
+            Self::spawn_pcm_with_richtap_cb(
+                Arc::clone(&self.inner),
+                Arc::clone(&self.gen),
+                gen,
+                Arc::new(pcm),
+                total_amp,
+                cb.cloned(),
+            );
+        } else if let Some(c) = cb {
+            let _ = c.onCallback(0);
+        }
+        Ok(())
+    }
+
     fn r#performHe(
         &self,
         looper: i32,
@@ -391,7 +477,7 @@ impl IOplusVibrator for OplusVibrator {
         Ok(())
     }
 
-    fn r#writeHapticAudio(&self, _data: &[i32]) -> BinderResult<()> {
+    fn r#writeHapticAudio(&self, _data: &str) -> BinderResult<()> {
         Ok(())
     }
 

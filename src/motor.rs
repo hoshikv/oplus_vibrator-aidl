@@ -188,8 +188,9 @@ impl Motor {
             return self.play_constant(dur, a);
         }
 
-        // Full hardware gain (0x80) so PCM scaling has smooth 0..100% linear dynamic range
-        let _ = self.set_hw_gain(1.0);
+        // Set hardware gain proportional to amplitude (0.25..1.0) alongside PCM scaling
+        // so both hardware DAC gain and PCM dynamic range track the intensity slider cleanly.
+        let _ = self.set_hw_gain((0.25 + 0.75 * a).clamp(0.0, 1.0));
 
         let mut custom_data = [0i16; 3];
         custom_data[0] = self.custom_wave_id;
