@@ -398,7 +398,7 @@ impl IVibrator for VibratorService {
                 match oplus_id {
                     105 => 0.72 + 0.16 * raw_amp,
                     4 | 315 => (raw_amp * 0.68).clamp(0.32, 0.72),
-                    2 => (raw_amp * 1.35).clamp(0.65, 1.0),
+                    2 => (raw_amp * 0.85).clamp(0.45, 0.85),
                     111 => (raw_amp * 1.15).clamp(0.50, 1.0),
                     107 => (raw_amp * 2.2).clamp(0.85, 1.0),
                     _ => raw_amp,

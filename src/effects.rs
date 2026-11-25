@@ -39,18 +39,7 @@ impl EffectLibrary {
             if let Ok(text) = fs::read_to_string(&json_path) {
                 lib.parse_oplus_json(&text, base, false);
             }
-            // Prefer snappy 9999/def/effect_2.bin (8.7ms @ 231Hz) for back gesture click
-            let crisp_back = Path::new(base).join("9999/def/effect_2.bin");
-            if crisp_back.exists() {
-                lib.def_effects.insert(
-                    2,
-                    EffectEntry {
-                        path: crisp_back,
-                        rate_hz: SAMPLE_RATE,
-                        cached: None,
-                    },
-                );
-            }
+            // Use official OPlus 0809/def/effect_2.bin (16ms @ 156Hz "duk") for Quick Launch & Back gesture
             if !lib.def_effects.is_empty() {
                 crate::alogi!(
                     "loaded OPlus waveforms from {} (0809 primary + 9999 extended): def={} soft={}",
