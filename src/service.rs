@@ -1,184 +1,107 @@
-
-
-
-
-
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use rsbinder::{Strong, BinderResult};
+use rsbinder::{BinderResult, Strong};
 
+use crate::effects::EffectLibrary;
 use crate::gen::android::hardware::vibrator::Braking::Braking;
+use crate::gen::android::hardware::vibrator::CompositeEffect::CompositeEffect;
 use crate::gen::android::hardware::vibrator::CompositePrimitive::CompositePrimitive;
+use crate::gen::android::hardware::vibrator::CompositePwleV2::CompositePwleV2;
 use crate::gen::android::hardware::vibrator::Effect::Effect;
 use crate::gen::android::hardware::vibrator::EffectStrength::EffectStrength;
+use crate::gen::android::hardware::vibrator::FrequencyAccelerationMapEntry::FrequencyAccelerationMapEntry as FontMatrixEntry;
 use crate::gen::android::hardware::vibrator::IVibrator::IVibrator;
 use crate::gen::android::hardware::vibrator::IVibratorCallback::IVibratorCallback;
+use crate::gen::android::hardware::vibrator::PrimitivePwle::PrimitivePwle;
 use crate::gen::android::hardware::vibrator::VendorEffect::VendorEffect;
 use crate::motor::Motor;
+use crate::synth;
 use crate::{alogd, aloge};
 
 const CAP_ON_CALLBACK: i32 = 1 << 0;
 const CAP_PERFORM_CALLBACK: i32 = 1 << 1;
 const CAP_AMPLITUDE_CONTROL: i32 = 1 << 2;
-
-
-
-
 const CAP_EXTERNAL_CONTROL: i32 = 1 << 3;
+const CAP_COMPOSE_EFFECTS: i32 = 1 << 5;
+const CAP_GET_RESONANT_FREQUENCY: i32 = 1 << 7;
+const CAP_GET_Q_FACTOR: i32 = 1 << 8;
 
-const MAX_FRAGMENT_MS: u16 = 0xFFFF;
-
-
-
-
-
-const SUSTAIN_MIN_MS: u16 = 250;
-
-
-
-
+const MAX_DURATION_MS: u16 = 0xFFFF;
 const DEFAULT_RING_PATTERN: &[u16] = &[60, 50, 60, 50, 60, 220];
-
-const DEFAULT_RING_AMP: f32 = 1.6;
-
-const SLIDER_IN_LO: f32 = 1.4583334;
-const SLIDER_IN_HI: f32 = 2.0;
-const SLIDER_OUT_LO: f32 = 0.5;
-const SLIDER_OUT_HI: f32 = 2.0;
-
-fn map_slider_amp(a: f32) -> f32 {
-    if a <= SLIDER_IN_LO {
-        (a * (SLIDER_OUT_LO / SLIDER_IN_LO)).clamp(0.0, SLIDER_OUT_LO)
-    } else {
-        SLIDER_OUT_LO
-            + (a - SLIDER_IN_LO) / (SLIDER_IN_HI - SLIDER_IN_LO)
-                * (SLIDER_OUT_HI - SLIDER_OUT_LO)
-    }
-}
+const DEFAULT_RING_AMP: f32 = 0.85;
 
 pub struct Inner {
-    motor: Option<Motor>,
-    current: i32,
-    last_base: u16,
-    last_len: u16,
+    pub(crate) motor: Option<Motor>,
+    pub(crate) effects: EffectLibrary,
+    /// Normalized user/slider intensity 0.0..=1.0
     pub(crate) amplitude: f32,
-
-
+    /// Dynamic scale for RichTap HE (0.0..=1.0)
+    pub(crate) dynamic_scale: f32,
+    /// 0 = Crisp (def_style), 1 = Gentle (soft_style)
+    pub(crate) touch_style: i32,
+    pub(crate) f0_hz: f32,
     pub(crate) ext_gen: u64,
     pub(crate) ext_active: bool,
-
     pub(crate) ext_saved_amp: Option<f32>,
 }
 
 impl Inner {
-
-
-
-    pub(crate) fn ring_pulse(&mut self, len_ms: u16, amp: f32) -> bool {
-        self.stop_effect();
-        let ok = match self.motor.as_mut() {
-            Some(_) if amp <= 0.0001 => {
-                alogd!("ring pulse suppressed (amp=0)");
-                false
-            }
-            Some(m) => m.play_loop(len_ms, amp).is_ok(),
-            None => false,
-        };
-        if ok {
-            self.current = 1;
-            self.last_base = 0xFFFF;
-            self.last_len = len_ms;
-        } else {
-            aloge!("ring pulse failed (amp={:.2} len={})", amp, len_ms);
-        }
-        ok
-    }
-
     pub(crate) fn stop_effect(&mut self) {
         if let Some(m) = self.motor.as_mut() {
-            m.remove(self.current);
-        }
-        self.current = -1;
-    }
-
-    fn effect_id_for(&self, base: u16) -> u16 {
-        if base <= 0xAAAA {
-            2
-        } else if base >= 0xEEEE {
-            7
-        } else {
-            1
+            m.stop();
         }
     }
 
-
-    pub(crate) fn upload(&mut self, base: u16, len_ms: u16, sustain: bool) -> bool {
-        let amp = self.amplitude.max(0.0);
-        self.stop_effect();
-        let use_tap = !sustain || len_ms < SUSTAIN_MIN_MS;
-        let eid = self.effect_id_for(base);
-        let ok = match self.motor.as_mut() {
-            Some(_) if amp <= 0.0001 => {
-                alogd!("upload suppressed (amp=0)");
-                false
-            }
-            Some(m) if use_tap => m.play_tap(eid, amp, len_ms).is_ok(),
-            Some(m) => m.play_loop(len_ms, amp).is_ok(),
+    pub(crate) fn play_constant(&mut self, len_ms: u16, amp: f32) -> bool {
+        let a = amp.clamp(0.0, 1.0);
+        if a <= 0.001 || len_ms == 0 {
+            self.stop_effect();
+            return false;
+        }
+        match self.motor.as_mut() {
+            Some(m) => m.play_constant(len_ms, a).is_ok(),
             None => false,
-        };
-        if ok {
-            self.current = 1;
-            self.last_base = base;
-            self.last_len = len_ms;
-        } else {
-            aloge!("upload failed (amp={:.2} len={})", amp, len_ms);
         }
-        ok
     }
 
-    fn rescale_current(&mut self) {
-        if self.current < 0 {
-            return;
-        }
-        if self.amplitude <= 0.0001 {
+    pub(crate) fn update_live_gain(&mut self) {
+        if self.amplitude <= 0.001 {
             self.stop_effect();
             return;
         }
         if let Some(m) = self.motor.as_mut() {
-            if let Err(e) = m.update(self.current, self.amplitude) {
-                aloge!("ff update failed: {:?}", e);
-            }
+            let _ = m.set_hw_gain(self.amplitude);
         }
     }
 }
 
 pub struct VibratorService {
     pub inner: Arc<Mutex<Inner>>,
-    gen: Arc<AtomicU64>,
+    pub gen: Arc<AtomicU64>,
 }
 
 impl VibratorService {
     pub fn new() -> Self {
         let motor = match Motor::open() {
-            Ok(m) => {
-                alogd!("motor attached (awinic_haptic sysfs)");
-                Some(m)
-            }
+            Ok(m) => Some(m),
             Err(e) => {
                 aloge!("motor open failed: {:?}", e);
                 None
             }
         };
+        let f0_hz = motor.as_ref().map(|m| m.f0_hz()).unwrap_or(170.0);
+        let effects = EffectLibrary::load();
         VibratorService {
             inner: Arc::new(Mutex::new(Inner {
                 motor,
-                current: -1,
-                last_base: 0,
-                last_len: 0,
+                effects,
                 amplitude: 1.0,
+                dynamic_scale: 1.0,
+                touch_style: 0,
+                f0_hz,
                 ext_gen: 0,
                 ext_active: false,
                 ext_saved_amp: None,
@@ -187,11 +110,52 @@ impl VibratorService {
         }
     }
 
-    fn next_gen(&self) -> u64 {
+    pub fn next_gen(&self) -> u64 {
         self.gen.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    pub fn stop_and_advance(&self) {
+        self.next_gen();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.ext_active = false;
+            inner.stop_effect();
+        }
+    }
 
+    /// Streams `pcm` asynchronously on a cancellable worker thread and fires `cb` on completion.
+    pub fn spawn_pcm_play(
+        inner: Arc<Mutex<Inner>>,
+        gen_arc: Arc<AtomicU64>,
+        gen: u64,
+        pcm: Arc<Vec<i8>>,
+        amp: f32,
+        cb: Option<Strong<dyn IVibratorCallback>>,
+    ) {
+        thread::spawn(move || {
+            let dur_ms = EffectLibrary::duration_ms(&pcm);
+            if let Ok(mut guard) = inner.lock() {
+                if gen_arc.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                if let Some(m) = guard.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp, &gen_arc, gen);
+                }
+            }
+            // Wait for hardware FIFO to finish playing
+            let mut left = dur_ms.max(10) as u64;
+            while left > 0 {
+                if gen_arc.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let step = left.min(15);
+                thread::sleep(Duration::from_millis(step));
+                left -= step;
+            }
+            if let Some(c) = cb.as_ref() {
+                let _ = c.onComplete();
+            }
+        });
+    }
 
     fn schedule_finish(
         &self,
@@ -205,146 +169,85 @@ impl VibratorService {
         let gen_arc = Arc::clone(&self.gen);
         thread::spawn(move || {
             if wait_for_off {
-
                 while gen_arc.load(Ordering::SeqCst) == gen {
-                    thread::sleep(Duration::from_millis(50));
+                    thread::sleep(Duration::from_millis(25));
                 }
             } else {
-                thread::sleep(Duration::from_millis(delay_ms as u64));
+                let mut left = delay_ms as u64;
+                while left > 0 {
+                    if gen_arc.load(Ordering::SeqCst) != gen {
+                        return;
+                    }
+                    let step = left.min(20);
+                    thread::sleep(Duration::from_millis(step));
+                    left -= step;
+                }
                 if gen_arc.load(Ordering::SeqCst) != gen {
                     return;
                 }
-                gen_arc.fetch_add(1, Ordering::SeqCst);
-                if let Ok(mut inner) = inner.lock() {
-                    inner.stop_effect();
+                if let Ok(mut guard) = inner.lock() {
+                    guard.stop_effect();
                 }
             }
             if let Some(c) = cb.as_ref() {
-                if c.onComplete().is_err() {
-                    alogd!("callback onComplete failed (client gone)");
-                }
+                let _ = c.onComplete();
             }
         });
     }
 
-    fn stop_and_advance(&self) {
-        self.next_gen();
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.stop_effect();
-        }
-    }
-
-
-
-
-
     fn set_external_control(&self, enabled: bool) {
         let gen = self.next_gen();
-        let (pattern, amp) = ring_config();
         let inner = Arc::clone(&self.inner);
+        let gen_arc = Arc::clone(&self.gen);
 
         if !enabled {
-            let had = match inner.lock() {
-                Ok(mut i) => {
-                    let had = i.ext_active;
-                    i.ext_active = false;
-                    i.ext_gen = gen;
-                    i.stop_effect();
-                    if let Some(saved) = i.ext_saved_amp.take() {
-                        i.amplitude = saved;
-                    }
-                    had
-                }
-                Err(_) => false,
-            };
-            alogd!(
-                "setExternalControl(false) had_active={} motor stopped",
-                had
-            );
-            return;
-        }
-
-        let armed = match inner.lock() {
-            Ok(mut i) => {
-                if i.ext_active {
-                    false
-                } else {
-                    i.ext_active = true;
-                    i.ext_gen = gen;
-                    i.ext_saved_amp = Some(i.amplitude);
-                    true
-                }
-            }
-            Err(_) => false,
-        };
-        if !armed {
-            alogd!("setExternalControl(true) ignored (already active)");
-            return;
-        }
-
-        let has_motor = match inner.lock() {
-            Ok(i) => i.motor.is_some(),
-            Err(_) => false,
-        };
-        if !has_motor {
-            alogd!("setExternalControl(true) but no motor attached; staying idle");
             if let Ok(mut i) = inner.lock() {
                 i.ext_active = false;
+                i.ext_gen = gen;
+                i.stop_effect();
+                if let Some(saved) = i.ext_saved_amp.take() {
+                    i.amplitude = saved;
+                }
             }
+            alogd!("setExternalControl(false)");
             return;
         }
 
-        alogd!(
-            "setExternalControl(true) ring haptics: pattern={:?} amp={:.2}",
-            pattern,
-            amp
-        );
+        let amp = {
+            let Ok(mut i) = inner.lock() else { return };
+            if i.ext_active {
+                return;
+            }
+            i.ext_active = true;
+            i.ext_gen = gen;
+            i.ext_saved_amp = Some(i.amplitude);
+            (i.amplitude * DEFAULT_RING_AMP).clamp(0.1, 1.0)
+        };
 
-        let pattern = Arc::new(pattern);
+        alogd!("setExternalControl(true) amp={:.2}", amp);
         thread::spawn(move || {
             let mut idx = 0usize;
-            loop {
-                if !ext_live(&inner, gen) {
-                    return;
-                }
-                let ms = pattern[idx % pattern.len()];
+            while gen_arc.load(Ordering::SeqCst) == gen {
+                let ms = DEFAULT_RING_PATTERN[idx % DEFAULT_RING_PATTERN.len()];
                 idx += 1;
                 let is_pulse = idx % 2 == 1;
-
                 if is_pulse {
-
-
-                    let mut waited = 0u32;
-                    loop {
-                        let busy = match inner.lock() {
-                            Ok(i) => i.current >= 0 || !i.ext_active || i.ext_gen != gen,
-                            Err(_) => true,
-                        };
-                        if !busy {
-                            break;
-                        }
-                        if !ext_live(&inner, gen) || waited > 2000 {
+                    if let Ok(mut i) = inner.lock() {
+                        if !i.ext_active || i.ext_gen != gen {
                             return;
                         }
-                        thread::sleep(Duration::from_millis(20));
-                        waited += 20;
+                        i.play_constant(ms, amp);
                     }
-                    if !ext_live(&inner, gen) {
+                }
+                let mut left = ms as u64;
+                while left > 0 {
+                    if gen_arc.load(Ordering::SeqCst) != gen {
                         return;
                     }
-                    if let Ok(mut i) = inner.lock() {
-                        i.amplitude = amp;
-                        i.ring_pulse(ms, amp);
-                    }
+                    let step = left.min(20);
+                    thread::sleep(Duration::from_millis(step));
+                    left -= step;
                 }
-
-                if !sleep_live(&inner, gen, ms as u64) {
-                    if let Ok(mut i) = inner.lock() {
-                        i.stop_effect();
-                    }
-                    return;
-                }
-
                 if is_pulse {
                     if let Ok(mut i) = inner.lock() {
                         if i.ext_active && i.ext_gen == gen {
@@ -357,63 +260,20 @@ impl VibratorService {
     }
 }
 
-
-fn ext_live(inner: &Arc<Mutex<Inner>>, gen: u64) -> bool {
-    match inner.lock() {
-        Ok(i) => i.ext_active && i.ext_gen == gen,
-        Err(_) => false,
-    }
-}
-
-
-fn sleep_live(inner: &Arc<Mutex<Inner>>, gen: u64, total_ms: u64) -> bool {
-    let mut left = total_ms;
-    while left > 0 {
-        if !ext_live(inner, gen) {
-            return false;
-        }
-        let step = left.min(20);
-        thread::sleep(Duration::from_millis(step));
-        left -= step;
-    }
-    ext_live(inner, gen)
-}
-
-
-fn ring_config() -> (Vec<u16>, f32) {
-    let pattern = std::env::var("HOSHIVK_RING_PATTERN")
-        .ok()
-        .map(|s| {
-            s.split(',')
-                .filter_map(|p| p.trim().parse::<u16>().ok())
-                .filter(|v| *v > 0)
-                .collect::<Vec<u16>>()
-        })
-        .filter(|v| v.len() >= 2)
-        .unwrap_or_else(|| DEFAULT_RING_PATTERN.to_vec());
-
-    let amp = std::env::var("HOSHIVK_RING_AMP")
-        .ok()
-        .and_then(|s| s.trim().parse::<f32>().ok())
-        .map(|a| a.clamp(0.0, 2.0))
-        .unwrap_or(DEFAULT_RING_AMP);
-
-    (pattern, amp)
-}
-
 impl IVibrator for VibratorService {
     fn r#getCapabilities(&self) -> BinderResult<i32> {
-        Ok(
-            CAP_ON_CALLBACK
-                | CAP_PERFORM_CALLBACK
-                | CAP_AMPLITUDE_CONTROL
-                | CAP_EXTERNAL_CONTROL,
-        )
+        Ok(CAP_ON_CALLBACK
+            | CAP_PERFORM_CALLBACK
+            | CAP_AMPLITUDE_CONTROL
+            | CAP_EXTERNAL_CONTROL
+            | CAP_COMPOSE_EFFECTS
+            | CAP_GET_RESONANT_FREQUENCY
+            | CAP_GET_Q_FACTOR)
     }
 
     fn r#off(&self) -> BinderResult<()> {
-
-
+        alogd!("IVibrator::off()");
+        self.stop_and_advance();
         Ok(())
     }
 
@@ -424,23 +284,18 @@ impl IVibrator for VibratorService {
     ) -> BinderResult<()> {
         let gen = self.next_gen();
         let len = if timeout_ms > 0 {
-            (timeout_ms as u32).min(MAX_FRAGMENT_MS as u32) as u16
+            (timeout_ms as u32).min(MAX_DURATION_MS as u32) as u16
         } else {
-            MAX_FRAGMENT_MS
+            MAX_DURATION_MS
         };
-        let ok = {
-            match self.inner.lock() {
-                Ok(mut inner) => inner.upload(0xFFFF, len, len >= SUSTAIN_MIN_MS),
-                Err(_) => false,
-            }
-        };
+        if let Ok(mut inner) = self.inner.lock() {
+            let amp = inner.amplitude;
+            inner.play_constant(len, amp);
+        }
         if timeout_ms <= 0 && callback.is_some() {
             self.schedule_finish(gen, 0, callback, true);
         } else if timeout_ms > 0 {
             self.schedule_finish(gen, len as u32, callback, false);
-        }
-        if !ok {
-            alogd!("on(): motor off/absent (amplitude=0 or no device)");
         }
         Ok(())
     }
@@ -451,23 +306,49 @@ impl IVibrator for VibratorService {
         strength: EffectStrength,
         callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<i32> {
-        let (len, base) = map_effect(effect);
-        let scale = match strength {
-            EffectStrength::LIGHT => 0.6,
-            EffectStrength::MEDIUM => 0.85,
+        let strength_scale = match strength {
+            EffectStrength::LIGHT => 0.55,
+            EffectStrength::MEDIUM => 0.80,
             EffectStrength::STRONG => 1.0,
-            _ => 0.85,
+            _ => 0.80,
         };
-        let mag = (base as f32 * scale) as u16;
+        let oplus_id = map_android_effect_to_oplus_id(effect);
         let gen = self.next_gen();
 
-        alogd!("perform effect={:?} strength={:?} len={} base={} mag={} scale={:.2}", effect, strength, len, base, mag, scale);
+        let (pcm_opt, amp, f0_hz) = {
+            let Ok(mut inner) = self.inner.lock() else {
+                return Ok(20);
+            };
+            let style = inner.touch_style;
+            let amp = (inner.amplitude * strength_scale).clamp(0.0, 1.0);
+            let f0 = inner.f0_hz;
+            let pcm = inner.effects.get_pcm(oplus_id, style);
+            (pcm, amp, f0)
+        };
 
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.upload(mag, len, false);
-        }
-        self.schedule_finish(gen, len as u32, callback, false);
-        Ok(len as i32)
+        let pcm = pcm_opt.unwrap_or_else(|| {
+            // Synthesize fallback click if .bin file not present
+            let fallback = synth::synthesize_he(&[], 1, 0, 1.0, 0, f0_hz);
+            Arc::new(fallback)
+        });
+        let dur_ms = EffectLibrary::duration_ms(&pcm);
+        alogd!(
+            "IVibrator::perform({:?}, {:?}) -> oplus_id={} amp={:.2} dur={}ms",
+            effect,
+            strength,
+            oplus_id,
+            amp,
+            dur_ms
+        );
+        Self::spawn_pcm_play(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.gen),
+            gen,
+            pcm,
+            amp,
+            callback.cloned(),
+        );
+        Ok(dur_ms)
     }
 
     fn r#getSupportedEffects(&self) -> BinderResult<Vec<Effect>> {
@@ -479,16 +360,26 @@ impl IVibrator for VibratorService {
             Effect::POP,
             Effect::HEAVY_CLICK,
             Effect::TEXTURE_TICK,
+            Effect::RINGTONE_1,
+            Effect::RINGTONE_2,
+            Effect::RINGTONE_3,
+            Effect::RINGTONE_4,
+            Effect::RINGTONE_5,
         ])
     }
 
     fn r#setAmplitude(&self, amplitude: f32) -> BinderResult<()> {
-        let amp = map_slider_amp(amplitude.clamp(0.0, 2.0)).clamp(0.0, 2.0);
+        // Android standard is (0.0, 1.0]; ColorOS sometimes passes up to 2.0
+        let amp = if amplitude > 1.0 {
+            (amplitude / 2.0).clamp(0.0, 1.0)
+        } else {
+            amplitude.clamp(0.0, 1.0)
+        };
         if let Ok(mut inner) = self.inner.lock() {
             inner.amplitude = amp;
-            inner.rescale_current();
+            inner.update_live_gain();
         }
-        alogd!("setAmplitude({}) -> {}", amplitude, amp);
+        alogd!("IVibrator::setAmplitude({:.3}) -> {:.3}", amplitude, amp);
         Ok(())
     }
 
@@ -498,7 +389,7 @@ impl IVibrator for VibratorService {
     }
 
     fn r#getCompositionDelayMax(&self) -> BinderResult<i32> {
-        Ok(0)
+        Ok(5000)
     }
 
     fn r#getCompositionSizeMax(&self) -> BinderResult<i32> {
@@ -510,7 +401,9 @@ impl IVibrator for VibratorService {
             CompositePrimitive::NOOP,
             CompositePrimitive::CLICK,
             CompositePrimitive::THUD,
+            CompositePrimitive::SPIN,
             CompositePrimitive::QUICK_RISE,
+            CompositePrimitive::SLOW_RISE,
             CompositePrimitive::QUICK_FALL,
             CompositePrimitive::LIGHT_TICK,
             CompositePrimitive::LOW_TICK,
@@ -527,39 +420,39 @@ impl IVibrator for VibratorService {
         callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<()> {
         if composite.is_empty() {
-            return Ok(());
-        }
-        let mut total = 0u16;
-        let mut peak = 0u16;
-        let mut any = false;
-        let mut steps = 0u16;
-        let mut max_delay = 0u16;
-        for e in composite {
-            total = (total as u32
-                + (e.delayMs.max(0) as u16) as u32
-                + primitive_duration(e.primitive) as u32)
-                .min(u16::MAX as u32) as u16;
-            if e.primitive != CompositePrimitive::NOOP {
-                any = true;
-                steps += 1;
+            if let Some(c) = callback {
+                let _ = c.onComplete();
             }
-            max_delay = max_delay.max(e.delayMs.max(0) as u16);
-            let s = e.scale.clamp(0.0, 2.0);
-            peak = peak.max((0xFFFF as f32 * (s.min(1.0) as f32)) as u16);
-        }
-
-
-
-        let rhythm = steps >= 2 || max_delay >= 100;
-        if !any {
             return Ok(());
         }
         let gen = self.next_gen();
-        alogd!("compose steps={} max_delay={} total={} rhythm={}", steps, max_delay, total, rhythm);
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.upload(peak, total, rhythm);
+        let (amp, f0_hz) = {
+            let Ok(inner) = self.inner.lock() else {
+                return Ok(());
+            };
+            (inner.amplitude, inner.f0_hz)
+        };
+        let pcm = Arc::new(synth::synthesize_compose(composite, 1.0, f0_hz));
+        if pcm.is_empty() {
+            if let Some(c) = callback {
+                let _ = c.onComplete();
+            }
+            return Ok(());
         }
-        self.schedule_finish(gen, total as u32, callback, false);
+        alogd!(
+            "IVibrator::compose(steps={}, dur={}ms, amp={:.2})",
+            composite.len(),
+            EffectLibrary::duration_ms(&pcm),
+            amp
+        );
+        Self::spawn_pcm_play(
+            Arc::clone(&self.inner),
+            Arc::clone(&self.gen),
+            gen,
+            pcm,
+            amp,
+            callback.cloned(),
+        );
         Ok(())
     }
 
@@ -573,11 +466,6 @@ impl IVibrator for VibratorService {
         _effect: Effect,
         _strength: EffectStrength,
     ) -> BinderResult<()> {
-        let gen = self.next_gen();
-        if let Ok(mut inner) = self.inner.lock() {
-            inner.upload(0xDDDD, 0xFFFF, false);
-        }
-        self.schedule_finish(gen, 0, None, true);
         Ok(())
     }
 
@@ -587,11 +475,12 @@ impl IVibrator for VibratorService {
     }
 
     fn r#getResonantFrequency(&self) -> BinderResult<f32> {
-        Ok(291.0)
+        let f0 = self.inner.lock().map(|i| i.f0_hz).unwrap_or(170.0);
+        Ok(f0)
     }
 
     fn r#getQFactor(&self) -> BinderResult<f32> {
-        Ok(50.0)
+        Ok(15.0)
     }
 
     fn r#getFrequencyResolution(&self) -> BinderResult<f32> {
@@ -599,7 +488,7 @@ impl IVibrator for VibratorService {
     }
 
     fn r#getFrequencyMinimum(&self) -> BinderResult<f32> {
-        Ok(200.0)
+        Ok(100.0)
     }
 
     fn r#getBandwidthAmplitudeMap(&self) -> BinderResult<Vec<f32>> {
@@ -631,13 +520,10 @@ impl IVibrator for VibratorService {
         _vendor_effect: &VendorEffect,
         _callback: Option<&Strong<dyn IVibratorCallback>>,
     ) -> BinderResult<()> {
-        alogd!("performVendorEffect unsupported");
         Err(rsbinder::StatusCode::ServiceSpecific(4).into())
     }
 
-    fn r#getFrequencyToOutputAccelerationMap(
-        &self,
-    ) -> BinderResult<Vec<FontMatrixEntry>> {
+    fn r#getFrequencyToOutputAccelerationMap(&self) -> BinderResult<Vec<FontMatrixEntry>> {
         Ok(vec![])
     }
 
@@ -664,53 +550,24 @@ impl IVibrator for VibratorService {
 
 impl rsbinder::Interface for VibratorService {}
 
-use crate::gen::android::hardware::vibrator::CompositeEffect::CompositeEffect;
-use crate::gen::android::hardware::vibrator::CompositePwleV2::CompositePwleV2;
-use crate::gen::android::hardware::vibrator::FrequencyAccelerationMapEntry::FrequencyAccelerationMapEntry as FontMatrixEntry;
-use crate::gen::android::hardware::vibrator::PrimitivePwle::PrimitivePwle;
-
-fn map_effect(effect: Effect) -> (u16, u16) {
+fn map_android_effect_to_oplus_id(effect: Effect) -> i32 {
     match effect {
-        Effect::CLICK => (60, 0xFFFF),
-        Effect::DOUBLE_CLICK => (130, 0xFFFF),
-        Effect::TICK => (25, 0xAAAA),
-        Effect::THUD => (110, 0xFFFF),
-        Effect::POP => (35, 0xFFFF),
-        Effect::HEAVY_CLICK => (80, 0xFFFF),
-        Effect::TEXTURE_TICK => (12, 0x7777),
-        Effect::RINGTONE_1
-        | Effect::RINGTONE_2
-        | Effect::RINGTONE_3
-        | Effect::RINGTONE_4
-        | Effect::RINGTONE_5
-        | Effect::RINGTONE_6
-        | Effect::RINGTONE_7
-        | Effect::RINGTONE_8
-        | Effect::RINGTONE_9
-        | Effect::RINGTONE_10
-        | Effect::RINGTONE_11
-        | Effect::RINGTONE_12
-        | Effect::RINGTONE_13
-        | Effect::RINGTONE_14
-        | Effect::RINGTONE_15 => (200, 0xCCCC),
-
-
-
-        _ => (20, 0xAAAA),
+        Effect::TEXTURE_TICK => 6,
+        _ => effect.0,
     }
 }
 
 fn primitive_duration(primitive: CompositePrimitive) -> u16 {
     match primitive {
         CompositePrimitive::NOOP => 0,
-        CompositePrimitive::CLICK => 60,
-        CompositePrimitive::THUD => 110,
-        CompositePrimitive::SPIN => 200,
-        CompositePrimitive::QUICK_RISE => 50,
-        CompositePrimitive::SLOW_RISE => 120,
-        CompositePrimitive::QUICK_FALL => 80,
-        CompositePrimitive::LIGHT_TICK => 15,
-        CompositePrimitive::LOW_TICK => 30,
-        _ => 40,
+        CompositePrimitive::CLICK => 12,
+        CompositePrimitive::LIGHT_TICK => 8,
+        CompositePrimitive::LOW_TICK => 14,
+        CompositePrimitive::THUD => 28,
+        CompositePrimitive::QUICK_RISE => 45,
+        CompositePrimitive::SLOW_RISE => 110,
+        CompositePrimitive::QUICK_FALL => 55,
+        CompositePrimitive::SPIN => 120,
+        _ => 15,
     }
 }
