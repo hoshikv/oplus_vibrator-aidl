@@ -157,6 +157,27 @@ impl EffectLibrary {
     pub fn duration_ms(pcm: &[i8]) -> i32 {
         ((pcm.len() as u64 * 1000) / SAMPLE_RATE as u64).max(10) as i32
     }
+
+    pub fn supported_ids(&self) -> Vec<i32> {
+        let mut ids: Vec<i32> = (0..=21).collect();
+        for &id in self.def_effects.keys() {
+            ids.push(id);
+        }
+        for &id in self.soft_effects.keys() {
+            ids.push(id);
+        }
+        for &id in self.xiaomi_fallback.keys() {
+            ids.push(id);
+        }
+        // Also cover ColorOS extended O-Haptics waveform IDs (0..=420) so VibrationThread
+        // never silently drops an OplusPrebakedSegment before reaching our HAL.
+        for id in 0..=420 {
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    }
 }
 
 fn load_or_cache(entry: &mut EffectEntry) -> Option<Arc<Vec<i8>>> {

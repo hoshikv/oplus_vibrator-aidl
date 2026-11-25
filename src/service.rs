@@ -352,20 +352,12 @@ impl IVibrator for VibratorService {
     }
 
     fn r#getSupportedEffects(&self) -> BinderResult<Vec<Effect>> {
-        Ok(vec![
-            Effect::CLICK,
-            Effect::DOUBLE_CLICK,
-            Effect::TICK,
-            Effect::THUD,
-            Effect::POP,
-            Effect::HEAVY_CLICK,
-            Effect::TEXTURE_TICK,
-            Effect::RINGTONE_1,
-            Effect::RINGTONE_2,
-            Effect::RINGTONE_3,
-            Effect::RINGTONE_4,
-            Effect::RINGTONE_5,
-        ])
+        let ids = self
+            .inner
+            .lock()
+            .map(|i| i.effects.supported_ids())
+            .unwrap_or_else(|_| (0..=420).collect());
+        Ok(ids.into_iter().map(Effect).collect())
     }
 
     fn r#setAmplitude(&self, amplitude: f32) -> BinderResult<()> {

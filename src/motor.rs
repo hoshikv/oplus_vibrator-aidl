@@ -144,7 +144,6 @@ impl Motor {
 
     pub fn stop(&mut self) {
         self.erase_ff();
-        let _ = fs::write(self.sysfs_dir.join("activate"), "0");
     }
 
     /// Plays continuous RAM-loop buzz using FF_CONSTANT for `duration_ms` at `amp` (0.0..=1.0).
