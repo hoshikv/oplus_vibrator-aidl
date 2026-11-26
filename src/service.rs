@@ -405,8 +405,8 @@ impl IVibrator for VibratorService {
                 }
             };
             if oplus_id == 111 {
-                // Hardware RAM mode: 0 = crisp click (def), 2 = lighter tick (soft)
-                let ram_id = if style == 1 { 2 } else { 0 };
+                // Hardware RAM mode: 4 = crisp pop/ndtuk (def), 2 = lighter tick (soft)
+                let ram_id = if style == 1 { 2 } else { 4 };
                 inner.short_rtp_until = Some(Instant::now() + Duration::from_millis(35));
                 if let Some(m) = inner.motor.as_mut() {
                     let _ = m.play_ram(ram_id, amp);
