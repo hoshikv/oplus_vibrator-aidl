@@ -125,33 +125,54 @@ pub fn synthesize_compose(composite: &[CompositeEffect], global_amp: f32, f0_hz:
 }
 
 fn synthesize_primitive(prim: CompositePrimitive, scale: f32, f0_hz: f32) -> Vec<i8> {
-    let (dur_ms, f_start, f_end, rise_frac, decay) = match prim {
-        CompositePrimitive::CLICK => (12, f0_hz * 1.05, f0_hz * 1.05, 0.15, 4.5),
-        CompositePrimitive::LIGHT_TICK => (8, f0_hz * 1.25, f0_hz * 1.25, 0.15, 5.5),
-        CompositePrimitive::LOW_TICK => (14, f0_hz * 0.85, f0_hz * 0.85, 0.15, 4.0),
-        CompositePrimitive::THUD => (28, f0_hz * 0.75, f0_hz * 0.65, 0.20, 3.0),
-        CompositePrimitive::QUICK_RISE => (45, f0_hz * 0.75, f0_hz * 1.20, 0.85, 1.5),
-        CompositePrimitive::SLOW_RISE => (110, f0_hz * 0.70, f0_hz * 1.15, 0.88, 1.2),
-        CompositePrimitive::QUICK_FALL => (55, f0_hz * 1.20, f0_hz * 0.75, 0.12, 2.8),
-        CompositePrimitive::SPIN => (120, f0_hz * 0.90, f0_hz * 1.15, 0.30, 1.0),
-        _ => (12, f0_hz, f0_hz, 0.15, 4.5),
+    // Per-primitive tuning for peridot's 0809 LRA (f0 ~ 169 Hz):
+    // - Keep continuous/ramping primitives (SPIN, SLOW_RISE, QUICK_RISE, QUICK_FALL)
+    //   near resonance and capped at safe mechanical headroom (max_gain) so high-scale
+    //   ramps (e.g. Android 17 PlatLogo Easter Egg) never bottom-out/rattle the LRA.
+    // - SPIN is 44ms so 58ms PlatLogo repeat cadence finishes cleanly without mid-wave
+    //   hard-cuts or aw86927 standby stalls.
+    let (dur_ms, f_start, f_end, rise_frac, decay, max_gain) = match prim {
+        CompositePrimitive::CLICK => (12, f0_hz * 1.03, f0_hz * 1.03, 0.15, 4.5, 0.92),
+        CompositePrimitive::LIGHT_TICK => (8, f0_hz * 1.15, f0_hz * 1.15, 0.15, 5.5, 0.85),
+        CompositePrimitive::LOW_TICK => (14, f0_hz * 0.92, f0_hz * 0.92, 0.15, 4.0, 0.85),
+        CompositePrimitive::THUD => (28, f0_hz * 0.85, f0_hz * 0.78, 0.20, 3.2, 0.80),
+        CompositePrimitive::QUICK_RISE => (45, f0_hz * 0.88, f0_hz * 1.10, 0.80, 2.5, 0.78),
+        CompositePrimitive::SLOW_RISE => (100, f0_hz * 0.85, f0_hz * 1.08, 0.82, 2.5, 0.75),
+        CompositePrimitive::QUICK_FALL => (55, f0_hz * 1.10, f0_hz * 0.88, 0.12, 3.0, 0.78),
+        CompositePrimitive::SPIN => (44, f0_hz * 0.96, f0_hz * 1.04, 0.25, 1.4, 0.72),
+        _ => (12, f0_hz, f0_hz, 0.15, 4.5, 0.85),
     };
     let n = (dur_ms * SAMPLE_RATE as usize) / 1000;
+    let fade_in_samples = ((3 * SAMPLE_RATE as usize) / 1000).min(n / 4).max(1);
+    let fade_out_samples = ((6 * SAMPLE_RATE as usize) / 1000).min(n / 3).max(1);
     let mut out = Vec::with_capacity(n);
     let mut phase = 0.0f32;
+    let eff_scale = scale.clamp(0.0, 1.0) * max_gain;
     for i in 0..n {
         let frac = i as f32 / n.max(1) as f32;
         let freq = f_start + (f_end - f_start) * frac;
-        let env = if frac < rise_frac {
+        let mut env = if frac < rise_frac {
             frac / rise_frac
         } else {
             (-(frac - rise_frac) * decay).exp()
         };
+        // Smooth cosine fade-in and fade-out to zero so no primitive ever ends with a step click/rattle.
+        if i < fade_in_samples {
+            let u = i as f32 / fade_in_samples as f32;
+            env *= 0.5 - 0.5 * (u * std::f32::consts::PI).cos();
+        }
+        let rem = n - 1 - i;
+        if rem < fade_out_samples {
+            let u = rem as f32 / fade_out_samples as f32;
+            env *= 0.5 - 0.5 * (u * std::f32::consts::PI).cos();
+        }
         phase += TAU * freq / SAMPLE_RATE as f32;
         if phase > TAU {
             phase -= TAU;
         }
-        let s = (phase.sin() * scale * env * 127.0).round().clamp(-128.0, 127.0) as i8;
+        let s = (phase.sin() * eff_scale * env * 127.0)
+            .round()
+            .clamp(-128.0, 127.0) as i8;
         out.push(s);
     }
     out

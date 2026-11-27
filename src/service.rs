@@ -704,9 +704,9 @@ fn primitive_duration(primitive: CompositePrimitive) -> u16 {
         CompositePrimitive::LOW_TICK => 14,
         CompositePrimitive::THUD => 28,
         CompositePrimitive::QUICK_RISE => 45,
-        CompositePrimitive::SLOW_RISE => 110,
+        CompositePrimitive::SLOW_RISE => 100,
         CompositePrimitive::QUICK_FALL => 55,
-        CompositePrimitive::SPIN => 120,
+        CompositePrimitive::SPIN => 44,
         _ => 15,
     }
 }
