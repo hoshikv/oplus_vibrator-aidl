@@ -287,7 +287,7 @@ impl Motor {
         }
 
         let dur_ms = ((pcm.len() as u64 * 1000) / SAMPLE_RATE as u64).max(5);
-        self.rtp_done_at = Some(Instant::now() + Duration::from_millis(dur_ms + 8));
+        self.rtp_done_at = Some(Instant::now() + Duration::from_millis(dur_ms + 20));
 
         Ok(())
     }

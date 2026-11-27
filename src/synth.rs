@@ -139,12 +139,12 @@ fn synthesize_primitive(prim: CompositePrimitive, scale: f32, f0_hz: f32) -> Vec
         CompositePrimitive::QUICK_RISE => (45, f0_hz * 0.88, f0_hz * 1.10, 0.80, 2.5, 0.78),
         CompositePrimitive::SLOW_RISE => (100, f0_hz * 0.85, f0_hz * 1.08, 0.82, 2.5, 0.75),
         CompositePrimitive::QUICK_FALL => (55, f0_hz * 1.10, f0_hz * 0.88, 0.12, 3.0, 0.78),
-        CompositePrimitive::SPIN => (44, f0_hz * 0.96, f0_hz * 1.04, 0.25, 1.4, 0.72),
+        CompositePrimitive::SPIN => (28, f0_hz, f0_hz, 0.25, 1.2, 0.65),
         _ => (12, f0_hz, f0_hz, 0.15, 4.5, 0.85),
     };
     let n = (dur_ms * SAMPLE_RATE as usize) / 1000;
-    let fade_in_samples = ((3 * SAMPLE_RATE as usize) / 1000).min(n / 4).max(1);
-    let fade_out_samples = ((6 * SAMPLE_RATE as usize) / 1000).min(n / 3).max(1);
+    let fade_in_samples = ((4 * SAMPLE_RATE as usize) / 1000).min(n / 3).max(1);
+    let fade_out_samples = ((8 * SAMPLE_RATE as usize) / 1000).min(n / 2).max(1);
     let mut out = Vec::with_capacity(n);
     let mut phase = 0.0f32;
     let eff_scale = scale.clamp(0.0, 1.0) * max_gain;

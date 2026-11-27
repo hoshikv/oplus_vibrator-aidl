@@ -578,12 +578,41 @@ impl IVibrator for VibratorService {
             }
             return Ok(());
         }
+        let dur_ms = EffectLibrary::duration_ms(&pcm);
         alogd!(
             "IVibrator::compose(steps={}, dur={}ms, amp={:.2})",
             composite.len(),
-            EffectLibrary::duration_ms(&pcm),
+            dur_ms,
             amp
         );
+        if dur_ms <= 60 {
+            // Short single/rapid compose (e.g. PlatLogo SPIN every ~58ms): write FIFO
+            // synchronously to avoid thread-spawn jitter and let the short cosine fade-out
+            // finish cleanly before any premature IVibrator::off() hard-cuts the LRA.
+            if let Ok(mut inner) = self.inner.lock() {
+                inner.short_rtp_until =
+                    Some(Instant::now() + Duration::from_millis((dur_ms as u64) + 22));
+                if let Some(m) = inner.motor.as_mut() {
+                    let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
+                }
+            }
+            if let Some(cb_cloned) = callback.cloned() {
+                let gen_arc = Arc::clone(&self.gen);
+                thread::spawn(move || {
+                    let mut left = (dur_ms as u64) + 18;
+                    while left > 0 {
+                        if gen_arc.load(Ordering::SeqCst) != gen {
+                            return;
+                        }
+                        let step = left.min(10);
+                        thread::sleep(Duration::from_millis(step));
+                        left -= step;
+                    }
+                    let _ = cb_cloned.onComplete();
+                });
+            }
+            return Ok(());
+        }
         Self::spawn_pcm_play(
             Arc::clone(&self.inner),
             Arc::clone(&self.gen),
@@ -706,7 +735,7 @@ fn primitive_duration(primitive: CompositePrimitive) -> u16 {
         CompositePrimitive::QUICK_RISE => 45,
         CompositePrimitive::SLOW_RISE => 100,
         CompositePrimitive::QUICK_FALL => 55,
-        CompositePrimitive::SPIN => 44,
+        CompositePrimitive::SPIN => 28,
         _ => 15,
     }
 }
