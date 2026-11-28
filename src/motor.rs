@@ -136,11 +136,13 @@ impl Motor {
         write_all_retry(self.evdev_fd, &ev)
     }
 
-    fn erase_ff(&mut self) {
+    fn erase_ff_inner(&mut self, force_stop: bool) {
         if self.active_ff_id >= 0 {
-            // Skip redundant EV_FF stop event if a previous short RTP already finished draining naturally;
-            // avoids queueing a spurious aw86927_rtp_work_routine(state=0) + 15ms standby stall on fast typing.
-            let already_drained = self.active_is_rtp
+            // Skip redundant EV_FF stop event ONLY when chaining into a new effect after a short
+            // RTP already drained. When stopping to idle (force_stop=true), ALWAYS send EV_FF 0 so
+            // aw86927 releases its pm_stay_awake("2-005a") kernel wakelock cleanly.
+            let already_drained = !force_stop
+                && self.active_is_rtp
                 && self
                     .rtp_done_at
                     .map(|t| Instant::now() >= t)
@@ -164,8 +166,12 @@ impl Motor {
         }
     }
 
+    fn erase_ff(&mut self) {
+        self.erase_ff_inner(false);
+    }
+
     pub fn stop(&mut self) {
-        self.erase_ff();
+        self.erase_ff_inner(true);
     }
 
     /// Plays continuous RAM-loop buzz using FF_CONSTANT for `duration_ms` at `amp` (0.0..=1.0).

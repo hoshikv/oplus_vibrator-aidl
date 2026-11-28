@@ -157,10 +157,57 @@ impl VibratorService {
                 thread::sleep(Duration::from_millis(step));
                 left -= step;
             }
+            if gen_arc.load(Ordering::SeqCst) == gen {
+                if let Ok(mut guard) = inner.lock() {
+                    if gen_arc.load(Ordering::SeqCst) == gen {
+                        guard.stop_effect();
+                    }
+                }
+            }
             if let Some(c) = cb.as_ref() {
                 let _ = c.onComplete();
             }
         });
+    }
+
+    /// Schedules an idle stop after a short sync effect finishes (only if no newer effect
+    /// has superseded `gen`), guaranteeing aw86927 releases its `2-005a` kernel wakelock.
+    fn schedule_idle_stop(&self, gen: u64, after_ms: u64, cb: Option<Strong<dyn IVibratorCallback>>) {
+        let inner = Arc::clone(&self.inner);
+        let gen_arc = Arc::clone(&self.gen);
+        thread::spawn(move || {
+            let mut left = after_ms;
+            while left > 0 {
+                if gen_arc.load(Ordering::SeqCst) != gen {
+                    return;
+                }
+                let step = left.min(15);
+                thread::sleep(Duration::from_millis(step));
+                left -= step;
+            }
+            if gen_arc.load(Ordering::SeqCst) != gen {
+                return;
+            }
+            if let Ok(mut guard) = inner.lock() {
+                if gen_arc.load(Ordering::SeqCst) == gen {
+                    guard.short_rtp_until = None;
+                    guard.stop_effect();
+                }
+            }
+            if let Some(c) = cb.as_ref() {
+                let _ = c.onComplete();
+            }
+        });
+    }
+
+    fn r#off_deferred(&self, until: Instant) {
+        let gen = self.gen.load(Ordering::SeqCst);
+        let wait_ms = until
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(300) as u64
+            + 5;
+        self.schedule_idle_stop(gen, wait_ms, None);
     }
 
     fn schedule_finish(
@@ -278,15 +325,26 @@ impl IVibrator for VibratorService {
     }
 
     fn r#off(&self) -> BinderResult<()> {
-        if let Ok(mut inner) = self.inner.lock() {
+        let deferred_until = if let Ok(mut inner) = self.inner.lock() {
             if let Some(until) = inner.short_rtp_until {
                 if Instant::now() < until {
-                    // Let short one-shot RTP effect finish draining aw86927 FIFO naturally
-                    alogd!("IVibrator::off() deferred (short RTP still draining)");
-                    return Ok(());
+                    Some(until)
+                } else {
+                    inner.short_rtp_until = None;
+                    None
                 }
+            } else {
+                None
             }
-            inner.short_rtp_until = None;
+        } else {
+            None
+        };
+        if let Some(until) = deferred_until {
+            // Let short one-shot RTP finish draining naturally, then ALWAYS send EV_FF stop
+            // once `until` elapses so aw86927 releases its 2-005a kernel wakelock.
+            alogd!("IVibrator::off() deferred (short RTP still draining)");
+            self.r#off_deferred(until);
+            return Ok(());
         }
         alogd!("IVibrator::off()");
         self.stop_and_advance();
@@ -323,21 +381,7 @@ impl IVibrator for VibratorService {
                 (dur, amp)
             };
             alogd!("IVibrator::on({}ms) -> sync crisp duk PCM amp={:.2} dur={}ms", timeout_ms, amp, dur_ms);
-            if let Some(cb_cloned) = callback.cloned() {
-                let gen_arc = Arc::clone(&self.gen);
-                thread::spawn(move || {
-                    let mut left = (dur_ms as u64) + 20;
-                    while left > 0 {
-                        if gen_arc.load(Ordering::SeqCst) != gen {
-                            return;
-                        }
-                        let step = left.min(15);
-                        thread::sleep(Duration::from_millis(step));
-                        left -= step;
-                    }
-                    let _ = cb_cloned.onComplete();
-                });
-            }
+            self.schedule_idle_stop(gen, (dur_ms as u64) + 55, callback.cloned());
             return Ok(());
         }
 
@@ -444,22 +488,12 @@ impl IVibrator for VibratorService {
             played_sync
         );
         if played_sync {
-            if let Some(cb_cloned) = callback.cloned() {
-                let gen_arc = Arc::clone(&self.gen);
-                let cb_margin = if oplus_id == 111 { 12 } else { 20 };
-                thread::spawn(move || {
-                    let mut left = (dur_ms as u64) + cb_margin;
-                    while left > 0 {
-                        if gen_arc.load(Ordering::SeqCst) != gen {
-                            return;
-                        }
-                        let step = left.min(10);
-                        thread::sleep(Duration::from_millis(step));
-                        left -= step;
-                    }
-                    let _ = cb_cloned.onComplete();
-                });
-            }
+            let stop_after = if oplus_id == 111 {
+                (dur_ms as u64) + 40
+            } else {
+                (dur_ms as u64) + 80
+            };
+            self.schedule_idle_stop(gen, stop_after, callback.cloned());
         } else {
             Self::spawn_pcm_play(
                 Arc::clone(&self.inner),
@@ -596,21 +630,7 @@ impl IVibrator for VibratorService {
                     let _ = m.play_pcm_cancellable(&pcm, amp, &self.gen, gen);
                 }
             }
-            if let Some(cb_cloned) = callback.cloned() {
-                let gen_arc = Arc::clone(&self.gen);
-                thread::spawn(move || {
-                    let mut left = (dur_ms as u64) + 18;
-                    while left > 0 {
-                        if gen_arc.load(Ordering::SeqCst) != gen {
-                            return;
-                        }
-                        let step = left.min(10);
-                        thread::sleep(Duration::from_millis(step));
-                        left -= step;
-                    }
-                    let _ = cb_cloned.onComplete();
-                });
-            }
+            self.schedule_idle_stop(gen, (dur_ms as u64) + 30, callback.cloned());
             return Ok(());
         }
         Self::spawn_pcm_play(
